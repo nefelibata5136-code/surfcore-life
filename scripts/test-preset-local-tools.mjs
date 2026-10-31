@@ -24,7 +24,15 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { pathToFileURL } from 'node:url';
-import { collectDshToolNames as collectDshToolNamesShared } from './dsh-tool-names.mjs';
+import {
+  collectDshToolNames as collectDshToolNamesShared,
+  DYNAMIC_TOOL_NAMES, INTENTIONAL_ABSENT_TOOLS,
+} from './dsh-tool-names.mjs';
+import { loadLocalEnv } from './local-env.mjs';
+
+// 本机私有配置（`.env.local`，git 忽略）：桌面版把 @deepseek-ai 打进 app.asar，
+// 反查不到安装目录时靠它给出 `DSH_ASAR`。没这个文件就退回「跳过」。
+const localEnvApplied = loadLocalEnv();
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const PRESETS_DIR = path.join(ROOT, 'dsh', 'agent-presets');
@@ -94,18 +102,42 @@ const LOCAL_EXECUTION_TOOLS = [
 function collectDshToolNames() {
   // 优先用本仓库 node_modules 里已安装的 DSH 包（离线回归不保证 profile 能反查到
   // DSH 安装目录；仓库依赖里就带着同一批 @deepseek-ai 包）。
+  //
+  // 2026-10-30 修正：仓库里现在只挂着 `dsh-host-apiproxy` + `schemastery` 两个包，
+  // 但 `node_modules/@deepseek-ai` 目录确实存在 ⇒ 旧实现直接拿它当唯一来源，只抽到
+  // 2 个名字，把 70 个**真实存在**的工具全报成「假名」。名字抽不全的方向很危险
+  // （它会逼人把真名字从守卫里删掉，等于自己拆安全边界），所以「包数太少」必须
+  // 等同于「没装」，退回共享的自动发现。
   const localPackages = path.join(ROOT, 'node_modules', '@deepseek-ai');
+  let localCount = 0;
+  try {
+    localCount = fs.readdirSync(localPackages, { withFileTypes: true })
+      .filter((e) => e.isDirectory() && e.name.startsWith('dsh-')).length;
+  } catch { /* 目录不存在 = 0 */ }
+  const REASONABLE_PACKAGE_COUNT = 20;
+  const options = localCount >= REASONABLE_PACKAGE_COUNT ? { packagesDir: localPackages } : {};
   let result;
   try {
-    result = collectDshToolNamesShared(fs.existsSync(localPackages) ? { packagesDir: localPackages } : {});
+    result = collectDshToolNamesShared(options);
   } catch {
     return null;
   }
-  const { names } = result;
+  const { names, sources } = result;
+  // 只有插件（undo_* / modlens / meme …）而没扫到 DSH 本体时，对账没有意义：
+  // 那会把 70 个 DSH 核心工具全报成「假名」。这种情况按「没找到工具包」跳过。
+  if (!sources || (!sources.packagesDir && !sources.asar)) return null;
   return names.size === 0 ? null : new Set(names.keys());
 }
 /** 允许出现在名单里、但不属于"本地执行"语义的名字（开发/注入器）。 */
 const DEV_TOOL_PREFIX = /^dev_/;
+
+/**
+ * 抽取器看不见的（`DYNAMIC_TOOL_NAMES`）与故意保留但本机没装的
+ * （`INTENTIONAL_ABSENT_TOOLS`）都定义在 `scripts/dsh-tool-names.mjs`，
+ * 与 `scan-dsh-tool-names.mjs` 共用，避免两处白名单各自漂移。
+ */
+const DYNAMICALLY_REGISTERED = DYNAMIC_TOOL_NAMES;
+const INTENTIONAL_ABSENT = INTENTIONAL_ABSENT_TOOLS;
 
 /** 允许出现的 MCP 命名空间前缀（QQ 动作面）。 */
 const EXPECTED_SAFE_PREFIXES = [
@@ -211,14 +243,18 @@ test('守卫名单里的每个名字都是 DSH 真实注册的工具（防拼错
   // 让整批限制悄悄少生效，而套件当时全绿。
   const dshNames = collectDshToolNames();
   if (dshNames === null) {
-    console.log('  ⏭  跳过：未找到 DSH 工具包（设 DSH_TOOL_PACKAGES 指向 @deepseek-ai 目录即可启用）');
+    console.log('  ⏭  跳过：未找到 DSH 工具包（在仓库根 .env.local 写 DSH_ASAR=<DSH>/resources/app.asar，'
+      + '或设 DSH_TOOL_PACKAGES / DSH_INSTALL_MODULES 即可启用）');
     return;
   }
   for (const id of SIMULATION_PRESETS) {
     const { dir } = readPreset(id);
     const mod = await import(pathToFileURL(path.join(dir, 'qq-tool-restrict.mjs')).href);
     const fabricated = mod.RESTRICTED_TOOL_NAMES
-      .filter((n) => !DEV_TOOL_PREFIX.test(n) && !dshNames.has(n));
+      .filter((n) => !DEV_TOOL_PREFIX.test(n)
+        && !DYNAMICALLY_REGISTERED.has(n)
+        && !INTENTIONAL_ABSENT.has(n)
+        && !dshNames.has(n));
     assert.deepEqual(fabricated, [],
       `${id}: 以下名字在 DSH 已安装的工具包里找不到 ⇒ restrict 会抛错并被吞掉，`
       + `限制静默失效：${fabricated.join(', ')}`);

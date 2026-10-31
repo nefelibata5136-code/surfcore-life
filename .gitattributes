@@ -1,0 +1,4 @@
+# 批处理必须在工作区里是 CRLF：cmd.exe 对 LF 的 `goto`/标签容错很差，
+# 而 zip 下载、某些编辑器/系统检出的默认是 LF。
+*.bat text eol=crlf
+*.cmd text eol=crlf

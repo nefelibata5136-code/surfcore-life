@@ -5,6 +5,10 @@ node_modules/
 # Runtime state and local config (never publish)
 state/
 config.json
+# 本机私有环境变量（DSH_ASAR 等本机路径），不发布
+.env.local
+# 本机隔离 DSH_HOME（安装演练用），不发布
+.sandbox-dsh/
 *.log
 *.bak
 *.bak-*
